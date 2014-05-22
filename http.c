@@ -364,8 +364,6 @@ evhttp_write_buffer(struct evhttp_connection *evcon,
 	evcon->cb = cb;
 	evcon->cb_arg = arg;
 
-	bufferevent_enable(evcon->bufev, EV_WRITE);
-
 	/* Disable the read callback: we don't actually care about data;
 	 * we only care about close detection.  (We don't disable reading,
 	 * since we *do* want to learn about any close events.) */
@@ -374,6 +372,8 @@ evhttp_write_buffer(struct evhttp_connection *evcon,
 	    evhttp_write_cb,
 	    evhttp_error_cb,
 	    evcon);
+
+	bufferevent_enable(evcon->bufev, EV_WRITE);
 }
 
 static void
@@ -552,9 +552,11 @@ evhttp_make_header_response(struct evhttp_connection *evcon,
 	/* Potentially add headers for unidentified content. */
 	if (evhttp_response_needs_body(req)) {
 		if (evhttp_find_header(req->output_headers,
-			"Content-Type") == NULL) {
+			"Content-Type") == NULL
+		    && evcon->http_server->default_content_type) {
 			evhttp_add_header(req->output_headers,
-			    "Content-Type", "text/html; charset=ISO-8859-1");
+			    "Content-Type",
+			    evcon->http_server->default_content_type);
 		}
 	}
 
@@ -1166,6 +1168,9 @@ evhttp_connection_free(struct evhttp_connection *evcon)
 	if (evcon->address != NULL)
 		mm_free(evcon->address);
 
+	if (evcon->conn_address != NULL)
+		mm_free(evcon->conn_address);
+
 	mm_free(evcon);
 }
 
@@ -1402,6 +1407,7 @@ evhttp_connection_cb(struct bufferevent *bufev, short what, void *arg)
 	struct evhttp_connection *evcon = arg;
 	int error;
 	ev_socklen_t errsz = sizeof(error);
+	socklen_t conn_address_len = sizeof(*evcon->conn_address);
 
 	if (evcon->fd == -1)
 		evcon->fd = bufferevent_getfd(bufev);
@@ -1417,6 +1423,12 @@ evhttp_connection_cb(struct bufferevent *bufev, short what, void *arg)
 #endif
 		evhttp_error_cb(bufev, what, arg);
 		return;
+	}
+
+	if (evcon->fd == -1) {
+		event_debug(("%s: bufferevent_getfd returned -1",
+			__func__));
+		goto cleanup;
 	}
 
 	/* Check if the connection completed */
@@ -1445,6 +1457,14 @@ evhttp_connection_cb(struct bufferevent *bufev, short what, void *arg)
 	/* Reset the retry count as we were successful in connecting */
 	evcon->retry_cnt = 0;
 	evcon->state = EVCON_IDLE;
+
+	if (!evcon->conn_address) {
+		evcon->conn_address = mm_malloc(sizeof(*evcon->conn_address));
+	}
+	if (getpeername(evcon->fd, (struct sockaddr *)evcon->conn_address, &conn_address_len)) {
+		mm_free(evcon->conn_address);
+		evcon->conn_address = NULL;
+	}
 
 	/* reset the bufferevent cbs */
 	bufferevent_setcb(evcon->bufev,
@@ -2130,6 +2150,14 @@ evhttp_read_header(struct evhttp_connection *evcon,
 	/* Disable reading for now */
 	bufferevent_disable(evcon->bufev, EV_READ);
 
+	/* Callback can shut down connection with negative return value */
+	if (req->header_cb != NULL) {
+		if ((*req->header_cb)(req, req->cb_arg) < 0) {
+			evhttp_connection_fail_(evcon, EVREQ_HTTP_EOF);
+			return;
+		}
+	}
+
 	/* Done reading headers, do the real work */
 	switch (req->kind) {
 	case EVHTTP_REQUEST:
@@ -2253,6 +2281,12 @@ struct bufferevent* evhttp_connection_get_bufferevent(struct evhttp_connection *
 	return evcon->bufev;
 }
 
+struct evhttp *
+evhttp_connection_get_server(struct evhttp_connection *evcon)
+{
+	return evcon->http_server;
+}
+
 struct evhttp_connection *
 evhttp_connection_base_new(struct event_base *base, struct evdns_base *dnsbase,
     const char *address, unsigned short port)
@@ -2332,6 +2366,12 @@ evhttp_connection_get_peer(struct evhttp_connection *evcon,
 {
 	*address = evcon->address;
 	*port = evcon->port;
+}
+
+const struct sockaddr*
+evhttp_connection_get_addr(struct evhttp_connection *evcon)
+{
+	return (struct sockaddr *)evcon->conn_address;
 }
 
 int
@@ -2512,6 +2552,10 @@ evhttp_send_done(struct evhttp_connection *evcon, void *arg)
 	struct evhttp_request *req = TAILQ_FIRST(&evcon->requests);
 	TAILQ_REMOVE(&evcon->requests, req, next);
 
+	if (req->on_complete_cb != NULL) {
+		req->on_complete_cb(req, req->on_complete_cb_arg);
+	}
+
 	need_close =
 	    (REQ_VERSION_BEFORE(req, 1, 1) &&
 		!evhttp_is_connection_keepalive(req->input_headers))||
@@ -2626,7 +2670,8 @@ evhttp_send_reply_start(struct evhttp_request *req, int code,
 }
 
 void
-evhttp_send_reply_chunk(struct evhttp_request *req, struct evbuffer *databuf)
+evhttp_send_reply_chunk_with_cb(struct evhttp_request *req, struct evbuffer *databuf,
+    void (*cb)(struct evhttp_connection *, void *), void *arg)
 {
 	struct evhttp_connection *evcon = req->evcon;
 	struct evbuffer *output;
@@ -2648,9 +2693,14 @@ evhttp_send_reply_chunk(struct evhttp_request *req, struct evbuffer *databuf)
 	if (req->chunked) {
 		evbuffer_add(output, "\r\n", 2);
 	}
-	evhttp_write_buffer(evcon, NULL, NULL);
+	evhttp_write_buffer(evcon, cb, arg);
 }
 
+void
+evhttp_send_reply_chunk(struct evhttp_request *req, struct evbuffer *databuf)
+{
+	evhttp_send_reply_chunk_with_cb(req, databuf, NULL, NULL);
+}
 void
 evhttp_send_reply_end(struct evhttp_request *req)
 {
@@ -3377,6 +3427,7 @@ evhttp_new_object(void)
 	evutil_timerclear(&http->timeout);
 	evhttp_set_max_headers_size(http, EV_SIZE_MAX);
 	evhttp_set_max_body_size(http, EV_SIZE_MAX);
+	evhttp_set_default_content_type(http, "text/html; charset=ISO-8859-1");
 	evhttp_set_allowed_methods(http,
 	    EVHTTP_REQ_GET |
 	    EVHTTP_REQ_POST |
@@ -3584,6 +3635,12 @@ evhttp_set_max_body_size(struct evhttp* http, ev_ssize_t max_body_size)
 }
 
 void
+evhttp_set_default_content_type(struct evhttp *http,
+	const char *content_type) {
+	http->default_content_type = content_type;
+}
+
+void
 evhttp_set_allowed_methods(struct evhttp* http, ev_uint16_t methods)
 {
 	http->allowed_methods = methods;
@@ -3774,10 +3831,25 @@ evhttp_request_set_chunked_cb(struct evhttp_request *req,
 }
 
 void
+evhttp_request_set_header_cb(struct evhttp_request *req,
+    int (*cb)(struct evhttp_request *, void *))
+{
+	req->header_cb = cb;
+}
+
+void
 evhttp_request_set_error_cb(struct evhttp_request *req,
     void (*cb)(enum evhttp_request_error, void *))
 {
 	req->error_cb = cb;
+}
+
+void
+evhttp_request_set_on_complete_cb(struct evhttp_request *req,
+    void (*cb)(struct evhttp_request *, void *), void *cb_arg)
+{
+	req->on_complete_cb = cb;
+	req->on_complete_cb_arg = cb_arg;
 }
 
 /*
@@ -4216,6 +4288,8 @@ parse_port(const char *s, const char *eos)
 			return -1;
 		portnum = (portnum * 10) + (*s - '0');
 		if (portnum < 0)
+			return -1;
+		if (portnum > 65535)
 			return -1;
 		++s;
 	}

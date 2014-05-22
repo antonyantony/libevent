@@ -92,10 +92,6 @@
 #include "event2/event_struct.h"
 #include "event2/thread.h"
 
-#include "event2/bufferevent.h"
-#include "event2/bufferevent_struct.h"
-#include "bufferevent-internal.h"
-
 #include "defer-internal.h"
 #include "log-internal.h"
 #include "mm-internal.h"
@@ -119,9 +115,9 @@
 #include <netinet/in6.h>
 #endif
 
-#define EVDNS_LOG_DEBUG 0
-#define EVDNS_LOG_WARN 1
-#define EVDNS_LOG_MSG 2
+#define EVDNS_LOG_DEBUG EVENT_LOG_DEBUG
+#define EVDNS_LOG_WARN EVENT_LOG_WARN
+#define EVDNS_LOG_MSG EVENT_LOG_MSG
 
 #ifndef HOST_NAME_MAX
 #define HOST_NAME_MAX 255
@@ -433,17 +429,6 @@ static int strtoint(const char *const str);
 	EVLOCK_ASSERT_LOCKED((base)->lock)
 #endif
 
-static void
-default_evdns_log_fn(int warning, const char *buf)
-{
-	if (warning == EVDNS_LOG_WARN)
-		event_warnx("[evdns] %s", buf);
-	else if (warning == EVDNS_LOG_MSG)
-		event_msgx("[evdns] %s", buf);
-	else
-		event_debug(("[evdns] %s", buf));
-}
-
 static evdns_debug_log_fn_type evdns_log_fn = NULL;
 
 void
@@ -458,25 +443,21 @@ evdns_set_log_fn(evdns_debug_log_fn_type fn)
 #define EVDNS_LOG_CHECK
 #endif
 
-static void evdns_log_(int warn, const char *fmt, ...) EVDNS_LOG_CHECK;
+static void evdns_log_(int severity, const char *fmt, ...) EVDNS_LOG_CHECK;
 static void
-evdns_log_(int warn, const char *fmt, ...)
+evdns_log_(int severity, const char *fmt, ...)
 {
 	va_list args;
-	char buf[512];
-	if (!evdns_log_fn)
-		return;
 	va_start(args,fmt);
-	evutil_vsnprintf(buf, sizeof(buf), fmt, args);
-	va_end(args);
 	if (evdns_log_fn) {
-		if (warn == EVDNS_LOG_MSG)
-			warn = EVDNS_LOG_WARN;
-		evdns_log_fn(warn, buf);
+		char buf[512];
+		int is_warn = (severity == EVDNS_LOG_WARN);
+		evutil_vsnprintf(buf, sizeof(buf), fmt, args);
+		evdns_log_fn(is_warn, buf);
 	} else {
-		default_evdns_log_fn(warn, buf);
+		event_logv_(severity, NULL, fmt, args);
 	}
-
+	va_end(args);
 }
 
 #define log evdns_log_
@@ -3992,6 +3973,10 @@ evdns_nameserver_free(struct nameserver *server)
 	event_debug_unassign(&server->event);
 	if (server->state == 0)
 		(void) event_del(&server->timeout_event);
+	if (server->probe_request) {
+		evdns_cancel_request(server->base, server->probe_request);
+		server->probe_request = NULL;
+	}
 	event_debug_unassign(&server->timeout_event);
 	mm_free(server);
 }
@@ -4007,6 +3992,15 @@ evdns_base_free_and_unlock(struct evdns_base *base, int fail_requests)
 
 	/* TODO(nickm) we might need to refcount here. */
 
+	for (server = base->server_head; server; server = server_next) {
+		server_next = server->next;
+		evdns_nameserver_free(server);
+		if (server_next == base->server_head)
+			break;
+	}
+	base->server_head = NULL;
+	base->global_good_nameservers = 0;
+
 	for (i = 0; i < base->n_req_heads; ++i) {
 		while (base->req_heads[i]) {
 			if (fail_requests)
@@ -4021,14 +4015,6 @@ evdns_base_free_and_unlock(struct evdns_base *base, int fail_requests)
 	}
 	base->global_requests_inflight = base->global_requests_waiting = 0;
 
-	for (server = base->server_head; server; server = server_next) {
-		server_next = server->next;
-		evdns_nameserver_free(server);
-		if (server_next == base->server_head)
-			break;
-	}
-	base->server_head = NULL;
-	base->global_good_nameservers = 0;
 
 	if (base->global_search_state) {
 		for (dom = base->global_search_state->head; dom; dom = dom_next) {
@@ -4060,6 +4046,18 @@ evdns_base_free(struct evdns_base *base, int fail_requests)
 {
 	EVDNS_LOCK(base);
 	evdns_base_free_and_unlock(base, fail_requests);
+}
+
+void
+evdns_base_clear_host_addresses(struct evdns_base *base)
+{
+	struct hosts_entry *victim;
+	EVDNS_LOCK(base);
+	while ((victim = TAILQ_FIRST(&base->hostsdb))) {
+		TAILQ_REMOVE(&base->hostsdb, victim, next);
+		mm_free(victim);
+	}
+	EVDNS_UNLOCK(base);
 }
 
 void
