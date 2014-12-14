@@ -2485,9 +2485,11 @@ evbuffer_write_atmost(struct evbuffer *buffer, evutil_socket_t fd,
 		/* XXX(nickm) Don't disable this code until we know if
 		 * the WSARecv code above works. */
 		void *p = evbuffer_pullup(buffer, howmuch);
+		EVUTIL_ASSERT(p || !howmuch);
 		n = send(fd, p, howmuch, 0);
 #else
 		void *p = evbuffer_pullup(buffer, howmuch);
+		EVUTIL_ASSERT(p || !howmuch);
 		n = write(fd, p, howmuch);
 #endif
 #ifdef USE_SENDFILE
@@ -2740,7 +2742,10 @@ evbuffer_peek(struct evbuffer *buffer, ev_ssize_t len,
 	if (n_vec == 0 && len < 0) {
 		/* If no vectors are provided and they asked for "everything",
 		 * pretend they asked for the actual available amount. */
-		len = buffer->total_len - len_so_far;
+		len = buffer->total_len;
+		if (start_at) {
+			len -= start_at->pos;
+		}
 	}
 
 	while (chain) {
@@ -3201,7 +3206,7 @@ evbuffer_add_file_segment(struct evbuffer *buf,
 	return 0;
 err:
 	EVBUFFER_UNLOCK(buf);
-	evbuffer_file_segment_free(seg);
+	evbuffer_file_segment_free(seg); /* Lowers the refcount */
 	return -1;
 }
 
